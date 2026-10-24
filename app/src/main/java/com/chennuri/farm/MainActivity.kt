@@ -161,10 +161,7 @@ fun SmartCropAdvisorScreen() {
 
     val analyzeLeaf: (Bitmap) -> Unit = { bitmap ->
         scope.launch {
-            if (
-                ApiKeys.GEMINI_API_KEY.isBlank() ||
-                ApiKeys.GEMINI_API_KEY == "PASTE_YOUR_REAL_GEMINI_KEY_HERE"
-            ) {
+            if (BuildConfig.GEMINI_API_KEY.isBlank()) {
                 errorMessage = "Gemini API కీ సెట్ చేయబడలేదు."
                 return@launch
             }
@@ -185,7 +182,7 @@ fun SmartCropAdvisorScreen() {
             )
 
             val repository = GeminiVisionRepository(
-                apiKey = ApiKeys.GEMINI_API_KEY
+                apiKey = BuildConfig.GEMINI_API_KEY
             )
 
             repository.diagnose(bitmap, fieldContext)
@@ -194,8 +191,14 @@ fun SmartCropAdvisorScreen() {
                     // Start Telugu TTS automatically after diagnosis succeeds
                     teluguTtsManager.speak(result.advisoryTelugu)
                 }
-                .onFailure { _ ->
-                    errorMessage = "ఆకును సరిగ్గా విశ్లేషించలేకపోయాము. దయచేసి స్పష్టమైన వెలుతురులో మరో ఫోటో తీయండి."
+                .onFailure { error ->
+                    android.util.Log.e(
+                        "GeminiDiagnosis",
+                        "Leaf diagnosis failed",
+                        error
+                    )
+
+                    errorMessage = "DEBUG: ${error.javaClass.simpleName}: ${error.message ?: "No details"}"
                 }
 
             isAnalyzing = false

@@ -20,23 +20,36 @@ import kotlin.random.Random
 
 class GeminiVisionRepository(
     private val apiKey: String,
+
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .writeTimeout(120, TimeUnit.SECONDS)
+        .callTimeout(180, TimeUnit.SECONDS)
         .build()
+
 ) {
     private val endpoint =
         "https://generativelanguage.googleapis.com/v1beta/models/" +
-                "gemini-2.5-flash:generateContent"
+                "gemini-3.8-flash:generateContent"
 
     suspend fun diagnose(
         leafBitmap: Bitmap,
         context: ContextPayload
     ): Result<DiagnosisResult> = withContext(Dispatchers.IO) {
-        try {
-            val base64Image = bitmapToBase64(leafBitmap)
 
+        try {
+            val totalStart = System.currentTimeMillis()
+
+            val imageStart = System.currentTimeMillis()
+            val base64Image = bitmapToBase64(leafBitmap)
+            android.util.Log.d(
+                "GeminiDiagnosis",
+                "Image compression: ${System.currentTimeMillis() - imageStart} ms, " +
+                        "Base64 size: ${base64Image.length / 1024} KB"
+            )
+
+            val bodyStart = System.currentTimeMillis()
             val requestBodyJson = buildRequestBody(
                 prompt = buildPrompt(context),
                 base64Image = base64Image
@@ -51,14 +64,27 @@ class GeminiVisionRepository(
                 )
                 .build()
 
+            android.util.Log.d(
+                "GeminiDiagnosis",
+                "Request preparation: ${System.currentTimeMillis() - bodyStart} ms"
+            )
+
             var lastError: Exception? = null
 
             repeat(4) { attempt ->
                 try {
+                    android.util.Log.d("GeminiDiagnosis", "Sending request to Gemini")
+                    val requestStart = System.currentTimeMillis()
+
                     val responseBody = client.newCall(request).execute().use { response ->
+                        android.util.Log.d(
+                            "GeminiDiagnosis",
+                            "Gemini HTTP ${response.code}, response time: " +
+                                    "${System.currentTimeMillis() - requestStart} ms"
+                        )
+
                         if (!response.isSuccessful) {
                             val errorBody = response.body?.string().orEmpty()
-
                             throw IOException(
                                 "Gemini request failed: HTTP ${response.code} $errorBody"
                             )
@@ -68,11 +94,22 @@ class GeminiVisionRepository(
                             ?: throw IOException("Empty response from Gemini")
                     }
 
-                    return@withContext Result.success(
-                        DiagnosisResult.fromJson(
-                            extractTextFromResponse(responseBody)
-                        )
+                    val parseStart = System.currentTimeMillis()
+                    val result = DiagnosisResult.fromJson(
+                        extractTextFromResponse(responseBody)
                     )
+
+                    android.util.Log.d(
+                        "GeminiDiagnosis",
+                        "JSON parsing: ${System.currentTimeMillis() - parseStart} ms"
+                    )
+                    android.util.Log.d(
+                        "GeminiDiagnosis",
+                        "Total repository time: ${System.currentTimeMillis() - totalStart} ms"
+                    )
+
+                    return@withContext Result.success(result)
+
                 } catch (error: IOException) {
                     lastError = error
 
@@ -81,57 +118,106 @@ class GeminiVisionRepository(
                                 error.message?.contains("HTTP 429") == true
 
                     if (!isTemporaryFailure || attempt == 3) {
+                        android.util.Log.e(
+                            "GeminiDiagnosis",
+                            "Request failed on attempt ${attempt + 1}",
+                            error
+                        )
                         return@withContext Result.failure(error)
                     }
 
                     val retryDelayMs =
-                        (1000L * (1 shl attempt)) + Random.nextLong(0, 500)
+                        (5000L * (1 shl attempt)) + Random.nextLong(0, 1000)
 
+                    android.util.Log.w(
+                        "GeminiDiagnosis",
+                        "Retrying after ${retryDelayMs} ms"
+                    )
                     delay(retryDelayMs)
+
                 } catch (error: Exception) {
                     return@withContext Result.failure(error)
                 }
             }
 
-            Result.failure(
-                lastError ?: IOException("Gemini diagnosis could not be completed.")
+            return@withContext Result.failure(
+                lastError ?: IOException("Gemini request failed")
             )
         } catch (error: Exception) {
-            Result.failure(error)
+            return@withContext Result.failure(error)
         }
+
     }
 
+
+
     private fun bitmapToBase64(bitmap: Bitmap): String {
-        val output = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output)
+        val maxSize = 1024
+        val scale = minOf(
+            1f,
+            maxSize.toFloat() / maxOf(bitmap.width, bitmap.height)
+        )
+
+        val resizedBitmap = if (scale < 1f) {
+            Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * scale).toInt(),
+                (bitmap.height * scale).toInt(),
+                true
+            )
+        } else {
+            bitmap
+        }
+
+        val outputStream = ByteArrayOutputStream()
+        resizedBitmap.compress(
+            Bitmap.CompressFormat.JPEG,
+            75,
+            outputStream
+        )
+
+        val imageBytes = outputStream.toByteArray()
 
         return Base64.encodeToString(
-            output.toByteArray(),
+            imageBytes,
             Base64.NO_WRAP
         )
     }
 
+
+
     private fun buildPrompt(context: ContextPayload): String = """
-        You are an agricultural plant-pathology assistant for Indian farmers.
-        Analyze the attached crop-leaf image.
+    You are an agricultural plant-pathology assistant for Indian farmers.
+    Analyze the attached crop-leaf image carefully.
 
-        Field context:
-        - Temperature: ${context.temperatureCelsius} °C
-        - Rain probability: ${context.rainProbabilityNext24hPercent}%
-        - Days after sowing: ${context.daysAfterSowing}
-        - Crop stage: ${context.cropStage.label}
+    Field context:
+    - Temperature: ${context.temperatureCelsius} °C
+    - Rain probability: ${context.rainProbabilityNext24hPercent}%
+    - Days after sowing: ${context.daysAfterSowing}
+    - Crop stage: ${context.cropStage.label}
 
-        Identify the crop and any visible disease or nutrient deficiency.
-        Reply with only valid JSON, with this exact structure:
+    Identify the crop and any visible disease or nutrient deficiency.
 
-        {
-          "crop": "string",
-          "disease": "string",
-          "confidence": 0.0,
-          "advisoryEnglish": "concise actionable advice",
-          "advisoryTelugu": "natural Telugu translation of the advice"
-        }
-    """.trimIndent()
+    LANGUAGE RULES:
+    - The "crop" value must be in Telugu only.
+    - The "disease" value must be in Telugu only.
+    - Do not include English disease names in parentheses.
+    - The "advisoryTelugu" value must be natural, simple Telugu.
+    - The "advisoryEnglish" value must be in English.
+    - If the plant appears healthy, state that in Telugu in the "disease" field.
+    - Do not invent a disease if the image is unclear.
+    - Keep "confidence" as a number between 0.0 and 1.0.
+
+    Reply with only valid JSON using this exact structure:
+    {
+      "crop": "తెలుగు పంట పేరు",
+      "disease": "తెలుగులో వ్యాధి పేరు",
+      "confidence": 0.0,
+      "advisoryEnglish": "Concise actionable advice in English",
+      "advisoryTelugu": "సరళమైన తెలుగులో సూచనలు"
+    }
+""".trimIndent()
+
 
     private fun buildRequestBody(
         prompt: String,
